@@ -1,5 +1,6 @@
 from django.db import models
 from django.db import connection
+from django.db.models.expressions import Col
 
 
 class ReferenceSource(models.OneToOneField):
@@ -39,13 +40,36 @@ class ReferenceSource(models.OneToOneField):
             self.source_table_name, self.reference_model_table_name
         )
 
+    @classmethod
+    def _find_cols(cls, parent):
+        from django.db.models.lookups import Lookup
+        if isinstance(parent, basestring):
+            return
+        elif isinstance(parent, Col):
+            yield parent
+        elif isinstance(parent, Lookup):
+            for x in cls._find_cols(parent.lhs):
+                yield x
+            for x in cls._find_cols(parent.rhs):
+                yield x
+        else:
+            if hasattr(parent, 'children'):
+                for child in parent.children:
+                    for x in cls._find_cols(child):
+                        yield x
+            else:
+                for expr in parent.get_source_expressions():
+                    if expr:
+                        for inner_expr in cls._find_cols(expr):
+                            yield inner_expr
+
     def get_proxy_and_foreign_cols(self):
         proxies = self.model.get_field_proxies()
         overrides = {
             proxy.reference_field: value
             for proxy in [p for p in proxies if p.foreign_fields]
                 for field, value in proxy.foreign_fields.iteritems()
-                    if field == self
+                    if field == self.name
         }  # nopep8
         proxy_field_cols = []
         foreign_cols = []
@@ -65,12 +89,16 @@ class ReferenceSource(models.OneToOneField):
                 )
                 ann = qs.query.annotations['ann_forex']
 
-                if (
-                    len(qs.query.tables) > 1 or
-                    self.source_table_name not in qs.query.tables
-                ):
+                extra_tables = {
+                    exp.alias for exp in self._find_cols(ann)
+                    if isinstance(exp, Col)
+                    and exp.alias != self.source_table_name
+                }
+
+                if extra_tables:
                     raise Exception(
-                        'Proxy expressions can only use 1 table'
+                        'Proxy expressions can only use 1 table, got %s'
+                        % extra_tables
                     )
 
                 # The rendered SQL refers to the tablename when we want
@@ -176,7 +204,7 @@ class ReferenceSource(models.OneToOneField):
         trigger_cols = {
             col.field.column
             for _, _, exp in foreign_cols
-            for col in [c for c in exp.flatten() if isinstance(c, Col)]
+            for col in self._find_cols(exp)
         }
 
         comma_sep_trigger_cols = ', '.join([col for col in trigger_cols])
@@ -250,7 +278,7 @@ class ProxiedField(AbstractProxy):
         foreign_field = kwargs.pop('foreign_field', None)
 
         self._run_init(
-            self, foreign_field=foreign_field,
+            self,foreign_field=foreign_field,
             foreign_fields=foreign_fields
         )
         kwargs['db_index'] = True
@@ -284,6 +312,7 @@ class ProxiedIntegerField(ProxiedField, models.IntegerField):
 
 class ProxiedForeignKey(ProxiedField, models.ForeignKey):
     def __init__(self, *args, **kwargs):
+        kwargs.setdefault('related_name', '+')
         args, kwargs = self._run_field_init(args, kwargs)
         super(ProxiedForeignKey, self).__init__(*args, **kwargs)
 
@@ -298,6 +327,12 @@ class ProxiedCharField(ProxiedField, models.CharField):
     def __init__(self, *args, **kwargs):
         args, kwargs = self._run_field_init(args, kwargs)
         super(ProxiedCharField, self).__init__(*args, **kwargs)
+
+
+class ProxiedBooleanField(ProxiedField, models.BooleanField):
+    def __init__(self, *args, **kwargs):
+        args, kwargs = self._run_field_init(args, kwargs)
+        super(ProxiedBooleanField, self).__init__(*args, **kwargs)
 
 
 class ReferenceQuerySet(models.QuerySet):
